@@ -2,19 +2,32 @@
 Build a single-file static HTML dashboard from a backtest result.
 
 Reads the most recent `results/*.json` (and its sibling `*.equity.csv`)
-and writes `dashboard/index.html`. The output is fully self-contained
-except for plotly.js, which is loaded from CDN -- so it opens directly
-in any browser without a server.
+and writes `dashboard/index.html`. The output is fully self-contained:
+plotly.js is inlined so the dashboard works on airgapped / offline boxes
+without loading anything from a CDN.
 
 Usage
 -----
     python scripts/build_dashboard.py
     python scripts/build_dashboard.py --result results/auto_2026.json
     python scripts/build_dashboard.py --output dashboard/run42.html
+    python scripts/build_dashboard.py --open               # auto-open in browser
+
+Notes
+-----
+The single-figure equivalent of this is:
+
+    import plotly.offline as pyo
+    pyo.plot(fig, filename='offline_chart.html', auto_open=True)
+
+We compose multiple figures (KPI cards + equity + drawdown) into a
+single HTML page, so we use `plotly.io.to_html(include_plotlyjs=True)`
+for the embed and `webbrowser.open()` for the auto-open.
 """
 from __future__ import annotations
 
 import json
+import webbrowser
 from html import escape
 from pathlib import Path
 
@@ -125,7 +138,10 @@ def render_drawdown_chart(equity: pd.Series) -> go.Figure:
 @click.option("--output", "output_path",
               default=str(ROOT / "dashboard" / "index.html"),
               type=click.Path(dir_okay=False), show_default=True)
-def main(result_path: str | None, results_dir: str, output_path: str) -> None:
+@click.option("--open", "auto_open", is_flag=True, default=False,
+              help="Open the rendered dashboard in the default browser. "
+                   "(Equivalent to plotly.offline.plot's auto_open=True for our multi-chart layout.)")
+def main(result_path: str | None, results_dir: str, output_path: str, auto_open: bool) -> None:
     json_path = Path(result_path) if result_path else find_latest_result(Path(results_dir))
     payload = json.loads(json_path.read_text())
     strategy = payload.get("strategy", {})
@@ -137,8 +153,11 @@ def main(result_path: str | None, results_dir: str, output_path: str) -> None:
     if equity_csv.exists():
         equity_df = pd.read_csv(equity_csv, parse_dates=["timestamp"], index_col="timestamp")
         equity = equity_df["value"]
+        # First chart inlines the full plotly.js bundle (~3.5 MB) so the
+        # dashboard works offline. Subsequent charts skip it (avoid duplicating
+        # the bundle on the same page).
         plots_html_parts.append(to_html(render_equity_chart(equity),
-                                        full_html=False, include_plotlyjs="cdn"))
+                                        full_html=False, include_plotlyjs=True))
         plots_html_parts.append(to_html(render_drawdown_chart(equity),
                                         full_html=False, include_plotlyjs=False))
     else:
@@ -166,6 +185,13 @@ def main(result_path: str | None, results_dir: str, output_path: str) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html)
     click.echo(f"Wrote {out}  ({len(html):,} bytes)")
+
+    if auto_open:
+        url = f"file://{out.resolve()}"
+        click.echo(f"Opening {url}")
+        # webbrowser.open returns False if no browser is available (e.g. headless
+        # CI). It does not raise, so this is safe in non-interactive environments.
+        webbrowser.open(url)
 
 
 if __name__ == "__main__":
