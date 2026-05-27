@@ -1,0 +1,96 @@
+name: Publish Dashboard
+
+# Builds the static dashboard from the sample backtest and publishes it
+# to GitHub Pages. Auto-runs on every push to main; can also be triggered
+# manually from the Actions tab.
+#
+# One-time setup required: in the repo Settings -> Pages, set
+#   Source: GitHub Actions
+# After the first successful run, the dashboard is reachable at:
+#   https://kjsingh281.github.io/NQ-Backtest-Engine/
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only rebuild when something that affects the dashboard changes
+      - "src/**"
+      - "scripts/**"
+      - "data/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - ".github/workflows/publish-dashboard.yml"
+  workflow_dispatch:
+
+# GitHub Pages requires write to id-token (deploy-pages uses OIDC) and pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent Pages deploy; queue follow-up runs without
+# cancelling the in-flight one (we want the latest result published).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run sample backtest
+        run: |
+          mkdir -p results
+          python scripts/run_backtest.py \
+            --strategy ema_cross \
+            --data data/sample_nq_1m.csv \
+            --output results/published.json \
+            --params '{"fast":3,"slow":7}' \
+            --all-hours
+
+      - name: Build dashboard
+        run: |
+          python scripts/build_dashboard.py \
+            --result results/published.json \
+            --output dashboard/index.html
+
+      - name: Add 404 fallback (so direct deep-links don't 404 to GitHub's page)
+        run: cp dashboard/index.html dashboard/404.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dashboard
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
