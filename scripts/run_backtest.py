@@ -48,8 +48,20 @@ def main(strategy: str, data_path: str, output_path: str, init_cash: float, rth_
         "kpis": result.kpis,
         "config": result.config,
     }
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_path).write_text(json.dumps(out, indent=2, default=str))
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2, default=str))
+
+    # Also dump the equity curve as a CSV next to the JSON, so the dashboard
+    # can render it without re-running the backtest. File suffix is `.equity.csv`
+    # so build_dashboard.py can find it via Path(json).with_suffix(".equity.csv").
+    try:
+        equity = result.portfolio.value()
+        equity_path = out_path.with_suffix(".equity.csv")
+        equity.to_frame("value").to_csv(equity_path, index_label="timestamp")
+    except Exception as exc:  # don't fail the run for a reporting nicety
+        click.echo(f"[warn] could not write equity curve: {exc}", err=True)
+
     click.echo(json.dumps(result.kpis, indent=2))
 
 

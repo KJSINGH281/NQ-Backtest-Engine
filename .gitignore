@@ -31,4 +31,5 @@ htmlcov/
 
 # Project artifacts
 results/
+dashboard/
 *.log

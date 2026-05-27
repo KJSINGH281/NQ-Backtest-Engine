@@ -1,10 +1,43 @@
-vectorbt>=0.26.0
-pandas>=2.0
-numpy>=1.24
+# ---------------------------------------------------------------------------
+# Web Dashboard
+# ---------------------------------------------------------------------------
+plotly>=5.18.0
+dash>=2.14.0
+flask>=3.0.0
+
+# ---------------------------------------------------------------------------
+# Data handling
+# ---------------------------------------------------------------------------
+pandas>=2.0.0
+numpy>=1.24.0
 numba>=0.58
 pytz
 python-dateutil
-pyyaml
+
+# ---------------------------------------------------------------------------
+# CLI / config (used by scripts/*.py)
+# ---------------------------------------------------------------------------
 click>=8.1
-pytest>=7.4
-pytest-cov>=4.1
+pyyaml
+
+# ---------------------------------------------------------------------------
+# Testing
+# ---------------------------------------------------------------------------
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# ---------------------------------------------------------------------------
+# VectorBT Core
+# Note: vectorbt[pro] requests the VectorBT Pro extras. Those live in a
+# private package index (vectorbtpro, paid). On public PyPI this resolves
+# to plain `vectorbt` with the `pro` extra silently dropped. If you have a
+# vectorbtpro license, install separately:
+#     pip install -U "vectorbtpro[base]" --index-url https://YOUR_TOKEN@pypi.vectorbt.pro/simple/
+# ---------------------------------------------------------------------------
+vectorbt[pro]>=0.25.0
+
+# ---------------------------------------------------------------------------
+# Optional: Real data (Databento NQ feed). Auth happens at API call time;
+# the package itself installs without credentials.
+# ---------------------------------------------------------------------------
+databento>=0.10.0
