@@ -1,4 +1,15 @@
 # .github/workflows/aws-backtest.yml
+#
+# Submits an NQ backtest to AWS Batch and persists the result artifacts.
+#
+# Authentication: GitHub Actions OIDC -> IAM role (no long-lived AWS keys).
+# Setup:          docs/aws-oidc-setup.md  (CloudFormation: infra/aws-oidc-github.yaml)
+#
+# Required repo configuration:
+#   - secret  AWS_BACKTEST_ROLE_ARN  : IAM role ARN to assume via OIDC.
+#   - var     RESULTS_BUCKET         : S3 bucket where the Batch container
+#                                      writes its results (read by this
+#                                      workflow to upload as an artifact).
 name: AWS Backtest Run
 
 on:
@@ -11,23 +22,77 @@ on:
         type: string
         default: "v2026.05"
 
+# Serialize same-strategy dispatches so they don't race on the S3 prefix.
+# Different strategies are still allowed to run in parallel.
+concurrency:
+  group: backtest-${{ inputs.strategy }}
+  cancel-in-progress: false
+
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Least-privilege at job scope (not workflow scope) so a future job
+    # added to this file does not silently inherit OIDC-mint capability.
+    permissions:
+      id-token: write   # required to mint the OIDC token for AWS
+      contents: read    # required for actions/checkout
+
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
-        aws-region: us-east-1
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BACKTEST_ROLE_ARN }}
+          role-session-name: gha-nq-backtest-${{ github.run_id }}
+          aws-region: us-east-1
 
-    - name: Run on AWS Batch (VectorBT optimized)
-      run: |
-        aws batch submit-job \
-          --job-name nq-backtest-${{ github.run_id }} \
-          --job-queue vectorbt-queue \
-          --job-definition vectorbt-job-def \
-          --parameters strategy=${{ inputs.strategy }},data=${{ inputs.data_version }}
+      - name: Submit AWS Batch job and wait for completion
+        id: batch
+        # Inputs are passed via `env` rather than interpolated into the
+        # `run` block. Direct ${{ inputs.* }} interpolation in shell scripts
+        # is a documented script-injection vector.
+        env:
+          STRATEGY: ${{ inputs.strategy }}
+          DATA_VERSION: ${{ inputs.data_version }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          JOB_ID=$(aws batch submit-job \
+            --job-name "nq-backtest-${RUN_ID}" \
+            --job-queue vectorbt-queue \
+            --job-definition vectorbt-job-def \
+            --parameters "strategy=${STRATEGY},data=${DATA_VERSION},runId=${RUN_ID}" \
+            --query jobId --output text)
+          echo "Submitted Batch job ${JOB_ID}"
+          echo "job_id=${JOB_ID}" >> "$GITHUB_OUTPUT"
+
+          # Poll until terminal state. Job-level timeout-minutes bounds total wait.
+          while :; do
+            STATUS=$(aws batch describe-jobs --jobs "${JOB_ID}" \
+              --query 'jobs[0].status' --output text)
+            echo "[$(date -u +%H:%M:%S)] status=${STATUS}"
+            case "${STATUS}" in
+              SUCCEEDED) break ;;
+              FAILED)    echo "::error::Batch job ${JOB_ID} failed"; exit 1 ;;
+              *)         sleep 30 ;;
+            esac
+          done
+
+      - name: Download backtest results from S3
+        env:
+          BUCKET: ${{ vars.RESULTS_BUCKET }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p ./results
+          aws s3 cp "s3://${BUCKET}/runs/${RUN_ID}/" ./results/ --recursive
+
+      - name: Upload backtest results as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ inputs.strategy }}-${{ github.run_id }}
+          path: ./results/
+          retention-days: 90
+          if-no-files-found: error
