@@ -1,0 +1,69 @@
+# .github/workflows/aws-backtest.yml
+name: AWS Backtest Run (OIDC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "Strategy name to backtest"
+        type: string
+        required: true
+      data_version:
+        description: "Historical data version"
+        type: string
+        default: "v2026.05"
+
+# OIDC requires id-token write permission
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1  # Can also use vars.AWS_REGION
+      PYTHON_VERSION: "3.11"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # role-session-name: github-backtest-${{ github.run_id }} # Optional
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install boto3 awscli
+
+      - name: Run Backtest
+        run: |
+          python scripts/run_backtest.py \
+            --strategy "${{ inputs.strategy }}" \
+            --data-version "${{ inputs.data_version }}" \
+            --output "results/backtest_${{ github.run_id }}.json"
+
+      - name: Upload Results to S3
+        run: |
+          aws s3 cp results/ s3://${{ secrets.BACKTEST_RESULTS_BUCKET }}/runs/${{ github.run_id }}/ \
+            --recursive --exclude "*" --include "*.json"
+
+      - name: Upload Artifacts (GitHub)
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results-${{ github.run_id }}
+          path: results/*.json
+          retention-days: 30
