@@ -1,0 +1,33 @@
+# .github/workflows/aws-backtest.yml
+name: AWS Backtest Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        type: string
+        required: true
+      data_version:
+        type: string
+        default: "v2026.05"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+        aws-region: us-east-1
+
+    - name: Run on AWS Batch (VectorBT optimized)
+      run: |
+        aws batch submit-job \
+          --job-name nq-backtest-${{ github.run_id }} \
+          --job-queue vectorbt-queue \
+          --job-definition vectorbt-job-def \
+          --parameters strategy=${{ inputs.strategy }},data=${{ inputs.data_version }}
