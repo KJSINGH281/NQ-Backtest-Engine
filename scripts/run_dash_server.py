@@ -9,20 +9,33 @@ This server reads the same ``results/*.json`` files plus their sibling
 
 Usage
 -----
-    python scripts/run_dashboard.py
-    python scripts/run_dashboard.py --port 8080 --debug
-    python scripts/run_dashboard.py --host 0.0.0.0     # expose on LAN
+    python scripts/run_dash_server.py
+    python scripts/run_dash_server.py --port 8080 --debug
+    python scripts/run_dash_server.py --host 0.0.0.0     # expose on LAN
 
 Security note
 -------------
 By default the server binds to ``127.0.0.1`` (loopback only). Pass
 ``--host 0.0.0.0`` only on a trusted network -- the dashboard has no
 authentication and exposes raw KPI data + equity curves.
+
+Troubleshooting
+---------------
+Port already in use ("Address already in use" / OSError 48 or 98)?
+    # Find what's holding it
+    lsof -i :8050                       # Linux / macOS
+    netstat -ano | findstr :8050        # Windows
+
+    # Or just pick a different one
+    python scripts/run_dash_server.py --port 8051
 """
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import socket
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -189,7 +202,33 @@ def main() -> None:
     # Dash >= 2.16 deprecated `app.run_server` in favor of `app.run`, and
     # Dash 3.x removed it. Prefer the new method, fall back if absent.
     runner = getattr(app, "run", None) or app.run_server
+
+    # Pre-flight: confirm the bind address is free, so we can print a
+    # friendlier message than Werkzeug's terse "Address already in use".
+    # There is a TOCTOU race between this check and the actual bind below,
+    # but in practice it covers the 99% case (something else holding the port).
+    _preflight_check_port(args.host, args.port)
+
     runner(host=args.host, port=args.port, debug=args.debug)
+
+
+def _preflight_check_port(host: str, port: int) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+            print(f"\nERROR: port {port} is already in use on {host}.", file=sys.stderr)
+            print("\nFind what's holding the port:", file=sys.stderr)
+            print(f"  lsof -i :{port}                       # Linux / macOS", file=sys.stderr)
+            print(f"  netstat -ano | findstr :{port}        # Windows", file=sys.stderr)
+            print("\nOr just pick a different one:", file=sys.stderr)
+            print(f"  python {sys.argv[0]} --port {port + 1}", file=sys.stderr)
+            sys.exit(1)
+        raise
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":
