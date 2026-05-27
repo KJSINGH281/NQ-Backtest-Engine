@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Actions OIDC trust + IAM role for the NQ-Backtest-Engine
+  AWS Batch dispatch workflow. Replaces the legacy long-lived
+  AWS_ACCESS_KEY / AWS_SECRET_KEY repo secrets used by
+  .github/workflows/aws-backtest.yml.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub username or org that owns the repository.
+    Default: YOUR_GITHUB_USERNAME
+
+  GitHubRepo:
+    Type: String
+    Description: Repository name (without owner).
+    Default: NQ-Backtest-Engine
+
+  AllowedRef:
+    Type: String
+    Description: >
+      Exact git ref the role will trust. Default is main; for tighter
+      scoping use an environment ref like
+      "environment:prod" via the AllowedSubClaim parameter instead.
+    Default: refs/heads/main
+
+  AllowedSubClaim:
+    Type: String
+    Description: >
+      Full sub-claim pattern. Overrides GitHubOwner/GitHubRepo/AllowedRef
+      when set. Leave empty to auto-build from the three params above.
+    Default: ''
+
+  BatchJobQueueArn:
+    Type: String
+    Description: ARN of the AWS Batch job queue this role can submit to.
+
+  BatchJobDefinitionArn:
+    Type: String
+    Description: ARN of the AWS Batch job definition this role can submit.
+
+  ResultsBucketName:
+    Type: String
+    Description: >
+      S3 bucket where the workflow runner uploads / fetches backtest result
+      artifacts (e.g. KPI JSON, equity-curve parquet). The role gets
+      PutObject/GetObject scoped to this bucket and ListBucket on its root.
+      This is separate from the Batch job container's IAM role; that role
+      should be configured on the AWS Batch job definition itself.
+    Default: your-backtest-results-bucket
+
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: >
+      Set to 'false' if a GitHub Actions OIDC provider already exists in
+      this account (only one is allowed per account per URL).
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+  UseAutoSubClaim: !Equals [!Ref AllowedSubClaim, '']
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # OIDC identity provider for token.actions.githubusercontent.com.
+  # ThumbprintList is technically required by CloudFormation but no longer
+  # validated by AWS at runtime (since Jul 2023, AWS verifies GitHub's cert
+  # against its own root CA bundle). We pass the two historically known
+  # intermediates so the template deploys on older toolchains too.
+  # See docs/aws-oidc-setup.md for context.
+  # ---------------------------------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ---------------------------------------------------------------------------
+  # IAM role assumed by the GitHub Actions workflow via OIDC.
+  # Trust policy mirrors the structure the user specified:
+  #   - StringEquals on the sub claim (exact ref match, not StringLike)
+  #   - aud claim explicitly pinned to sts.amazonaws.com (added on top of the
+  #     user-provided template; without this, any audience could request the
+  #     token. AWS docs flag aud-pinning as required to prevent token confusion.)
+  # ---------------------------------------------------------------------------
+  BacktestDispatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'github-actions-${AWS::StackName}'
+      Description: !Sub 'Assumed by GitHub Actions in ${GitHubOwner}/${GitHubRepo} to submit NQ backtests to AWS Batch.'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !If
+                  - UseAutoSubClaim
+                  - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:${AllowedRef}'
+                  - !Ref AllowedSubClaim
+
+  # ---------------------------------------------------------------------------
+  # Least-privilege permissions for what the workflow actually does:
+  # `aws batch submit-job` against one queue + one job definition.
+  # ---------------------------------------------------------------------------
+  BatchSubmitPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-batch-submit'
+      Roles:
+        - !Ref BacktestDispatchRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SubmitBacktestJob
+            Effect: Allow
+            Action:
+              - batch:SubmitJob
+            Resource:
+              - !Ref BatchJobQueueArn
+              - !Ref BatchJobDefinitionArn
+          - Sid: ReadBatchStatus
+            Effect: Allow
+            Action:
+              - batch:DescribeJobs
+              - batch:ListJobs
+            Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # S3 access for backtest result artifacts (runner-side reads/writes).
+  # The Batch container itself uses a separate job role; configure that on
+  # the Batch job definition, not here.
+  # ---------------------------------------------------------------------------
+  ResultsBucketPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-results-bucket'
+      Roles:
+        - !Ref BacktestDispatchRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadWriteBacktestResults
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${ResultsBucketName}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ResultsBucketName}/*'
+
+Outputs:
+  RoleArn:
+    Description: >
+      Set this value as the AWS_BACKTEST_ROLE_ARN secret in the GitHub repo
+      (Settings -> Secrets and variables -> Actions).
+    Value: !GetAtt BacktestDispatchRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+
+  TrustedSubClaim:
+    Description: The sub-claim pattern this role trusts.
+    Value: !If
+      - UseAutoSubClaim
+      - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:${AllowedRef}'
+      - !Ref AllowedSubClaim
